@@ -36,6 +36,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
+#include "osd.h"
 #include "latency_ring.h"
 #include "sio.h"
 #include "psx_netplay.h"
@@ -3765,6 +3766,14 @@ static void sdl_vblank_present(void) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
                 }
+                /* Ctrl+Y: show/hide the frame-stats overlay. Same state the
+                 * PSX_OSD env var seeds and the `osd` TCP command sets, so all
+                 * three agree. The timing rings keep filling while it is
+                 * hidden, so it comes back with real numbers rather than
+                 * spending a couple of seconds converging from zero. */
+                else if (key == SDLK_y && (mod & KMOD_CTRL)) {
+                    psx_osd_set_enabled(!psx_osd_enabled());
+                }
                 /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
                  * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
                  * borderless desktop fullscreen keeping the desktop resolution
@@ -4319,6 +4328,14 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
     int src_w = (int)present_w * active_scale;
     int src_h = (int)h * active_scale;
+    /* Frame-stats overlay, composited into the present buffer before ANY
+     * backend sees it, so GL / SDL / Vulkan all show the same thing and it is
+     * captured by `screenshot`. sdl_pixel_buf is rebuilt every frame, so
+     * writing into it here cannot accumulate. */
+    if (psx_osd_enabled() && !g_gl_active) {   /* GL composites inside gl_renderer_present */
+        psx_osd_draw_argb(sdl_pixel_buf, src_w, src_h,
+                          (int)(src_w * sizeof(uint32_t)));
+    }
     if (g_gl_active) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above

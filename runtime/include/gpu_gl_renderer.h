@@ -153,16 +153,27 @@ int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
 
 /* frame_perf: aggregate the per-frame GPU/CPU phase-timing ring (debug server
  * "frame_perf"). wide_filter: -1 = all frames, 0 = 4:3 present, 1 = native-wide.
- * Fills out[13]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
+ * Fills out[20]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
  * (frame minus the present call), [4]=present_wall_ms avg, [5]=scene_gpu_ms avg,
  * [6]=scene_gpu_ms max, [7]=present_gpu_ms avg, [8]=present_gpu_ms max,
  * [9]=scene primitives/frame avg (pre double-draw), [10]=mirror_gpu_ms avg (of
  * scene_gpu, the native-wide mirror passes; GL_TIMESTAMP pairs), [11]=mirror_gpu_ms
  * max, [12]=mirror passes/frame avg, [13]=CPU wall in flush_tex_batch avg,
  * [14]=CPU wall in glb_wide_* avg, [15]=batches/frame avg, [16]=wide target
- * sets/frame avg, [17]=wide FBO creations/frame avg. GPU phases are true
- * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
-int gl_renderer_perf_aggregate(int wide_filter, double out[18]);
+ * sets/frame avg, [17]=wide FBO creations/frame avg, [18]=timed draw
+ * brackets/frame avg, [19]=untimed (pool-overflow) brackets/frame avg.
+ *
+ * scene_gpu ([5]/[6]) is BUSY time: one TIME_ELAPSED query per hr_begin/hr_end
+ * draw bracket, summed over the frame. It replaced a single query spanning the
+ * whole inter-present interval, which also counted every gap in which the
+ * emulated CPU ran and issued no GL work — a span, not a cost, whose max
+ * pinned to the vsync interval on any vsync-paced frame. If [19] is non-zero
+ * the frame overflowed the query pool and [5]/[6] UNDERCOUNT. Returns count. */
+int gl_renderer_perf_aggregate(int wide_filter, double out[20]);
+
+/* 0 = this driver's GL_TIMESTAMP queries return 0 (Apple GL does), so the
+ * mirror_gpu_ms split is unavailable and must not be read as "mirror is free". */
+int gl_renderer_perf_mirror_timing_ok(void);
 
 /* Native-wide mirror ablation (perf attribution, debug cmd gl_ws_ablate):
  * 0 = normal, 1 = skip the whole mirror pass (incl. wide_clear), 2 = full mirror
