@@ -1925,6 +1925,36 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         int native_w = g_wide_w - 2 * g_wide_off;
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+        /* ...but ONLY when the generic per-prim mirror would NOT already cover
+         * the whole wide surface on its own. gpu.c's ws_expand_fullscreen_rect
+         * normally widens a full-screen rect to the full wide width BEFORE it
+         * reaches the backend; once it has, the mirror's own x-translation
+         * (wide_dx) already spans [0, g_wide_w) and the direct pass below is a
+         * REDUNDANT SECOND application of the same primitive.
+         *
+         * That redundancy is not harmless. The canonical draw goes through the
+         * deferred flat BATCH (gpu_geometry queues; flush_flat_batch draws), so
+         * s_wide_suppress — cleared as soon as the triangles are queued — never
+         * reaches the flush that actually mirrors them. The wide surface then
+         * gets the overlay on a different schedule from the canonical
+         * framebuffer, and a semi-transparent full-screen filter (Harvest Moon
+         * BTN's environmental tint, GP0 0x2A, semi mode 2 = B-F) lands on the
+         * 16:9 reveal margins with a visibly different result from the 4:3
+         * centre: a hard colour seam at the old screen edge. Measured on the
+         * graveyard save, margins vs centre: dG -24, dB -40, dR 0.
+         *
+         * Letting the pre-widened rect go through the generic mirror keeps it in
+         * the same batch and the same order as its canonical twin, and matches
+         * the software renderer (the reference) to within the usual ~8/255
+         * backend dithering offset in centre and both margins alike.
+         *
+         * The direct pass is still needed when the rect was NOT pre-widened —
+         * e.g. a framebuffer at base_x != 0, where ws_expand_fullscreen_rect's
+         * VRAM-x test cannot recognise the rect as full-screen. */
+        if (overlay) {
+            int wx0 = x + wide_dx(), wx1 = wx0 + w;
+            if (wx0 <= 0 && wx1 >= g_wide_w) overlay = 0;
+        }
     }
     if (overlay) s_wide_suppress = 1;
     gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
