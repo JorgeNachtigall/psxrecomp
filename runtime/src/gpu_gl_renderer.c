@@ -243,6 +243,10 @@ static PFN_glQueryCounter        p_glQueryCounter;
 static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
 static void gl_perf_mirror_begin(void); /* frame_perf: GPU-time bracket around ONE native-wide */
 static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits scene canonical/mirror) */
+static void osd_gl_overlay(void);       /* frame-stats overlay, blitted before every swap */
+static void wincap_grab(void);          /* window_capture: read back the default FB at swap */
+static void gl_perf_scene_begin(void);  /* frame_perf: GPU-time bracket around ONE hr draw bracket */
+static void gl_perf_scene_end(void);    /* (timestamp pair; summed = true scene GPU busy time) */
 /* Native-wide mirror ABLATION (perf attribution, debug cmd gl_ws_ablate):
  * 0 = normal, 1 = skip the whole mirror pass, 2 = full mirror state churn but no
  * draw calls, 3 = mirror draws land in the hr FBO (no per-pass FBO rebind; wide
@@ -318,6 +322,7 @@ static int           s_req_scale = 1;      /* requested before context init */
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
 static GLuint        s_osd_tex = 0;
+static GLuint        s_stats_osd_tex = 0;  /* frame-stats panel (osd_gl_overlay) */
 static int           s_osd_tw = 0, s_osd_th = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static void          gl_swap_with_osd(void);
@@ -1206,8 +1211,12 @@ static void apply_psx_blend(int mode) {
     }
 }
 
-/* ---- hr FBO render-state bracket ---------------------------------------- */
+/* ---- hr FBO render-state bracket ----------------------------------------
+ * EVERY scene draw goes through this bracket, which is why the frame_perf
+ * scene-busy timestamp pair lives here rather than at the individual draw
+ * sites: a new draw path cannot be added that silently escapes measurement. */
 static void hr_begin(int clip_to_draw_area) {
+    gl_perf_scene_begin();
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -1229,6 +1238,7 @@ static void hr_end(void) {
     p_glBindVertexArray(0);
     p_glUseProgram(0);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    gl_perf_scene_end();
 }
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
@@ -2826,6 +2836,7 @@ void gl_renderer_shutdown(void) {
     s_osd_tex = 0;
     s_osd_tw = 0;
     s_osd_th = 0;
+    s_stats_osd_tex = 0;   /* frame-stats panel: same stale-texture hazard */
     s_depth24_skip_up = 0;
     rect_clear(&s_d24_skip_fb);
     hold_invalidate();
@@ -2842,6 +2853,15 @@ void gl_renderer_shutdown(void) {
  * widescreen presents them pillarboxed instead of distorted. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
+    /* Frame-stats overlay. Hooked HERE rather than at the main-loop present
+     * call because this is the function that actually uploads the buffer, so
+     * every presented GL frame gets it -- the main-loop site was reached but
+     * composited only once (verified via psx_osd_draw_count). `pixels` is the
+     * runtime scratch present buffer, fully rewritten each frame, so writing
+     * into it cannot accumulate. */
+    { extern void psx_osd_draw_argb(uint32_t *, int, int, int);
+      psx_osd_draw_argb((uint32_t *)pixels, src_w, src_h,
+                        (int)(src_w * sizeof(uint32_t))); }
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3367,7 +3387,9 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
 typedef struct {
     double   total_ms;        /* present-entry to present-entry (full frame)  */
     double   present_wall_ms; /* CPU wall time inside the present call         */
-    double   scene_gpu_ms;    /* GPU: all scene draws this frame               */
+    double   scene_gpu_ms;    /* GPU: summed BUSY time of this frame's scene draws */
+    double   scene_draws;     /* draw brackets TIMED into scene_gpu_ms this frame */
+    double   scene_draws_over;/* brackets past the pool (untimed => scene_gpu undercounts) */
     double   present_gpu_ms;  /* GPU: the present clear+blit                   */
     double   mirror_gpu_ms;   /* GPU: of scene_gpu, the native-wide mirror passes */
     double   prims;           /* scene primitives submitted this frame         */
@@ -3390,14 +3412,38 @@ typedef struct {
 static GLuint s_mq_q[GLPERF_NBUF][GLPERF_MIRQ * 2];
 static int    s_mq_n[GLPERF_NBUF];     /* pairs recorded this frame        */
 static int    s_mq_over[GLPERF_NBUF];  /* passes beyond the pool (counted, untimed) */
+
+/* Scene GPU BUSY time — one TIME_ELAPSED query per hr_begin/hr_end draw
+ * bracket, summed at readback.
+ *
+ * This replaces a single scene query that was opened right after one present
+ * and closed at the next. That one spanned the whole inter-present interval,
+ * so every gap in which the emulated CPU ran and issued no GL work counted as
+ * "scene GPU time": its max pinned to the vsync interval while present_wall
+ * simultaneously reported idle (self-contradictory), and reading it as cost
+ * overstated scene work by an order of magnitude — it is what made a
+ * 284-primitive frame read as 32 us/prim and sent a widescreen session hunting
+ * a GPU bottleneck that did not exist.
+ *
+ * Why not GL_TIMESTAMP pairs, like the mirror pool: Apple's GL (4.1 Metal)
+ * exports glQueryCounter but its results come back 0, which is why
+ * mirror_gpu_ms has always reported 0.000 here against 6 mirror passes/frame.
+ * TIME_ELAPSED does work. It cannot nest, so the frame-spanning query had to
+ * go — no loss, it was the misleading number. Brackets do not nest either
+ * (depth-guarded below), so a flat pool of one query each is sufficient. */
+#define GLPERF_SCENEQ 512              /* timed draw brackets per frame */
+static GLuint s_sq_q[GLPERF_NBUF][GLPERF_SCENEQ];
+static int    s_sq_n[GLPERF_NBUF];     /* brackets timed this frame        */
+static int    s_sq_over[GLPERF_NBUF];  /* brackets beyond the pool (untimed) */
+static int    s_sq_open = 0;           /* begin issued, end pending        */
+static int    s_sq_depth = 0;          /* only the OUTERMOST bracket is timed */
+static int    s_sq_b = 0;              /* buffer latched at begin          */
 static int    s_mq_open = 0;           /* begin issued, end pending        */
 static int    s_mq_ok = 0;             /* glQueryCounter available         */
 
 static int      s_pf_on = 0;
-static GLuint   s_pf_scene_q[GLPERF_NBUF];
 static GLuint   s_pf_present_q[GLPERF_NBUF];
 static int      s_pf_b = 0;            /* buffer for the CURRENT frame         */
-static int      s_pf_scene_active = 0;
 static uint64_t s_pf_count = 0;
 static uint64_t s_pf_freq = 1;
 static uint64_t s_pf_last_enter = 0;
@@ -3428,18 +3474,43 @@ static void gl_perf_init(void) {
         if (enabled && enabled[0] == '0') return;
     }
     if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
-    p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
     p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
-    s_mq_ok = (p_glQueryCounter != NULL);
+    /* glQueryCounter's mere presence does not mean it WORKS: Apple's GL
+     * (4.1 Metal) exports the entry point and returns 0 from every GL_TIMESTAMP
+     * query. That silently reported mirror_gpu_ms = 0.000 against 6-8 mirror
+     * passes per frame — a broken measurement reading as "the mirror is free",
+     * the same class of error that made the whole-frame scene span read as GPU
+     * cost. Probe it once at init and mark the mechanism unavailable rather
+     * than publishing zeros. (Scene busy time uses TIME_ELAPSED and is
+     * unaffected; a proper TIME_ELAPSED mirror split needs the pass to stop
+     * nesting inside the scene and present queries, which is a larger change.) */
+    s_mq_ok = 0;
+    if (p_glQueryCounter) {
+        GLuint probe[2];
+        p_glGenQueries(2, probe);
+        p_glQueryCounter(probe[0], GL_TIMESTAMP);
+        p_glQueryCounter(probe[1], GL_TIMESTAMP);
+        glFlush();
+        GLuint64 t0 = 0, t1 = 0;
+        p_glGetQueryObjectui64v(probe[0], GL_QUERY_RESULT, &t0);
+        p_glGetQueryObjectui64v(probe[1], GL_QUERY_RESULT, &t1);
+        s_mq_ok = (t0 != 0 || t1 != 0);
+        if (p_glDeleteQueries) p_glDeleteQueries(2, probe);
+    }
     if (s_mq_ok)
         for (int i = 0; i < GLPERF_NBUF; i++) {
             p_glGenQueries(GLPERF_MIRQ * 2, s_mq_q[i]);
             s_mq_n[i] = 0; s_mq_over[i] = 0;
         }
+    for (int i = 0; i < GLPERF_NBUF; i++) {   /* scene brackets: TIME_ELAPSED, not timestamps */
+        p_glGenQueries(GLPERF_SCENEQ, s_sq_q[i]);
+        s_sq_n[i] = 0; s_sq_over[i] = 0;
+    }
     s_mq_open = 0;
+    s_sq_open = 0; s_sq_depth = 0; s_sq_b = 0;
     s_pf_freq = SDL_GetPerformanceFrequency();
     if (!s_pf_freq) s_pf_freq = 1;
-    s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
+    s_pf_b = 0; s_pf_count = 0; s_pf_ring_seq = 0;
     s_pf_last_enter = 0;
     s_pf_on = 1;
 #endif
@@ -3448,9 +3519,12 @@ static void gl_perf_init(void) {
 /* Bracket ONE native-wide mirror pass (called from the wide-mirror draw sites).
  * Timestamp pairs, not TIME_ELAPSED — see the pool comment above. */
 static void gl_perf_mirror_begin(void) {
-    if (!s_pf_on || !s_mq_ok) return;
+    if (!s_pf_on) return;
     int b = s_pf_b;
-    if (s_mq_n[b] >= GLPERF_MIRQ) { s_mq_over[b]++; return; }
+    /* s_mq_over is the "counted but untimed" bucket, so passes still tally when
+     * the driver's timestamps are dead — mirror_passes stays truthful even
+     * though mirror_gpu_ms is withheld (mirror_timing_ok = 0). */
+    if (!s_mq_ok || s_mq_n[b] >= GLPERF_MIRQ) { s_mq_over[b]++; return; }
     p_glQueryCounter(s_mq_q[b][s_mq_n[b] * 2], GL_TIMESTAMP);
     s_mq_open = 1;
 }
@@ -3460,6 +3534,28 @@ static void gl_perf_mirror_end(void) {
     p_glQueryCounter(s_mq_q[b][s_mq_n[b] * 2 + 1], GL_TIMESTAMP);
     s_mq_n[b]++;
     s_mq_open = 0;
+}
+
+/* Bracket ONE hr_begin/hr_end scene draw bracket. Depth-guarded so a nested
+ * bracket (a draw path that re-opens one) times the outermost only, and the
+ * buffer index is latched at begin so a frame rollover between begin and end
+ * cannot write the pair's halves into two different pools. */
+static void gl_perf_scene_begin(void) {
+    if (!s_pf_on) return;
+    if (s_sq_depth++ != 0) return;
+    int b = s_pf_b;
+    if (s_sq_n[b] >= GLPERF_SCENEQ) { s_sq_over[b]++; s_sq_open = 0; return; }
+    s_sq_b = b;
+    p_glBeginQuery(GL_TIME_ELAPSED, s_sq_q[b][s_sq_n[b]]);
+    s_sq_open = 1;
+}
+static void gl_perf_scene_end(void) {
+    if (!s_pf_on) return;
+    if (s_sq_depth > 0 && --s_sq_depth != 0) return;
+    if (!s_sq_open) return;
+    p_glEndQuery(GL_TIME_ELAPSED);
+    s_sq_n[s_sq_b]++;
+    s_sq_open = 0;
 }
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
@@ -3482,6 +3578,10 @@ static void gl_perf_present_enter(void) {
     s_pf_last_enter = now;
     s_pf_prims_pending = (double)(s_scene_prims - s_pf_prims_last);   /* prims drawn this frame */
     s_pf_prims_last = s_scene_prims;
+    { extern void psx_osd_set_extra(const char *, double);   /* second OSD line */
+      psx_osd_set_extra("PRIM", s_pf_prims_pending);
+      extern void psx_osd_frame_tick(void);   /* one tick per PRESENTED frame */
+      psx_osd_frame_tick(); }
     s_pf_cw_pending[0] = s_cw_flush_ms;  s_pf_cw_pending[1] = s_cw_wide_ms;
     s_pf_cw_pending[2] = (double)s_cw_batches;
     s_pf_cw_pending[3] = (double)s_cw_wide_sets;
@@ -3489,7 +3589,6 @@ static void gl_perf_present_enter(void) {
     s_cw_flush_ms = 0.0; s_cw_wide_ms = 0.0;
     s_cw_batches = 0; s_cw_wide_sets = 0; s_cw_wide_cfgs = 0;
     s_cw_wide_clears = 0; s_cw_fbo_creates = 0;
-    if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; } /* end frame b's scene draws */
     p_glBeginQuery(GL_TIME_ELAPSED, s_pf_present_q[s_pf_b]);                         /* time frame b's present */
 }
 
@@ -3506,8 +3605,7 @@ static void gl_perf_present_exit(int wide) {
     s_pf_buf_frame[s_pf_b] = s_pf_count;
     int rd = (s_pf_b + 1) % GLPERF_NBUF;   /* oldest buffer (frame count+1-NBUF), now done */
     if (s_pf_count >= (uint64_t)GLPERF_NBUF) {
-        GLuint64 sc = 0, pr = 0;
-        p_glGetQueryObjectui64v(s_pf_scene_q[rd],   GL_QUERY_RESULT, &sc);
+        GLuint64 pr = 0;
         p_glGetQueryObjectui64v(s_pf_present_q[rd], GL_QUERY_RESULT, &pr);
         double mir = 0.0;
         for (int i = 0; i < s_mq_n[rd]; i++) {   /* sum that frame's mirror pairs */
@@ -3516,10 +3614,19 @@ static void gl_perf_present_exit(int wide) {
             p_glGetQueryObjectui64v(s_mq_q[rd][i * 2 + 1], GL_QUERY_RESULT, &t1);
             if (t1 > t0) mir += (double)(t1 - t0);
         }
+        double busy = 0.0;
+        for (int i = 0; i < s_sq_n[rd]; i++) {   /* sum that frame's draw brackets */
+            GLuint64 t0 = 0, t1 = 0;
+            p_glGetQueryObjectui64v(s_sq_q[rd][i * 2],     GL_QUERY_RESULT, &t0);
+            p_glGetQueryObjectui64v(s_sq_q[rd][i * 2 + 1], GL_QUERY_RESULT, &t1);
+            if (t1 > t0) busy += (double)(t1 - t0);
+        }
         GlPerfSample *s = &s_pf_ring[s_pf_ring_seq % GLPERF_RING];
         s->total_ms        = s_pf_buf_total[rd];
         s->present_wall_ms = s_pf_buf_pwall[rd];
-        s->scene_gpu_ms    = (double)sc / 1.0e6;
+        s->scene_gpu_ms      = busy / 1.0e6;
+        s->scene_draws       = (double)s_sq_n[rd];
+        s->scene_draws_over  = (double)s_sq_over[rd];
         s->present_gpu_ms  = (double)pr / 1.0e6;
         s->mirror_gpu_ms   = mir / 1.0e6;
         s->prims           = s_pf_buf_prims[rd];
@@ -3534,10 +3641,9 @@ static void gl_perf_present_exit(int wide) {
         s_pf_ring_seq++;
     }
     s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */
+    s_sq_n[rd] = 0; s_sq_over[rd] = 0;
     s_pf_count++;
     s_pf_b = rd;                                          /* reuse oldest for next frame */
-    p_glBeginQuery(GL_TIME_ELAPSED, s_pf_scene_q[s_pf_b]); /* open next frame's scene draws */
-    s_pf_scene_active = 1;
 }
 
 /* Aggregate the ring for the debug server. wide_filter: -1 all, 0 = 4:3, 1 = wide.
@@ -3546,13 +3652,17 @@ static void gl_perf_present_exit(int wide) {
  * [8]=present_gpu_max. Returns the sample count. */
 /* Cumulative textured fraction of scene prims (decides flat vs textured batching
  * priority). out_tex_frac = textured/total since boot; returns total prim count. */
+/* 0 = the GL_TIMESTAMP mechanism behind mirror_gpu_ms is non-functional on this
+ * driver, so that field is absent rather than zero. See the probe in gl_perf_init. */
+int gl_renderer_perf_mirror_timing_ok(void) { return s_mq_ok; }
+
 uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
     if (out_tex_frac) *out_tex_frac = s_scene_prims ? (double)s_scene_prims_tex / (double)s_scene_prims : 0.0;
     return s_scene_prims;
 }
 
-int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
-    for (int i = 0; i < 18; i++) out[i] = 0.0;
+int gl_renderer_perf_aggregate(int wide_filter, double out[20]) {
+    for (int i = 0; i < 20; i++) out[i] = 0.0;
     if (!s_pf_on) return 0;
     int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
     uint64_t start = s_pf_ring_seq - (uint64_t)navail;
@@ -3565,6 +3675,8 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
         out[3] += emu;
         out[4] += s->present_wall_ms;
         out[5] += s->scene_gpu_ms;   if (s->scene_gpu_ms > out[6]) out[6] = s->scene_gpu_ms;
+        out[18] += s->scene_draws;
+        out[19] += s->scene_draws_over;
         out[7] += s->present_gpu_ms; if (s->present_gpu_ms > out[8]) out[8] = s->present_gpu_ms;
         out[9] += s->prims;
         out[10] += s->mirror_gpu_ms; if (s->mirror_gpu_ms > out[11]) out[11] = s->mirror_gpu_ms;
@@ -3578,7 +3690,7 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
     }
     if (n) {
         out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; out[10]/=n; out[12]/=n;
-        out[13]/=n; out[14]/=n; out[15]/=n; out[16]/=n; out[17]/=n;
+        out[13]/=n; out[14]/=n; out[15]/=n; out[16]/=n; out[17]/=n; out[18]/=n; out[19]/=n;
     }
     out[0] = (double)n;
     return n;
@@ -3961,6 +4073,11 @@ static void gl_swap_with_osd(void) {
         }
     }
     host_osd_present_done();
+    /* Frame-stats overlay last, so it sits on top of the host toasts, then the
+     * window_capture read-back -- which must be the final thing before the swap
+     * or it would miss whatever was drawn after it. */
+    osd_gl_overlay();
+    wincap_grab();
     SDL_GL_SwapWindow(s_win);
 }
 
@@ -4161,6 +4278,93 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * disp_y+disp_h] region into the letterbox, V-flipped like present_vram (FBO y
  * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
+
+/* Blit the frame-stats overlay into the top-left of the default framebuffer.
+ * Called immediately before every SwapWindow, because the GL present paths
+ * differ (4:3 present_vram, native-wide present_wide_fbo, and a repeat-present
+ * fast path) and only the swap is common to all of them. The panel is opaque,
+ * so this needs no blending and no shader change -- it reuses the present
+ * program with the viewport clipped to the panel rectangle. */
+
+/* ---- window capture -----------------------------------------------------
+ * Reads back the DEFAULT framebuffer exactly as it is about to be swapped, so
+ * it captures what the user actually sees -- including GPU-side overlays that
+ * never touch VRAM or any CPU frame buffer, which both `screenshot` (raw VRAM)
+ * and `screenshot_hires` (compositor surface) are blind to. Armed one-shot from
+ * the debug server, filled at the next swap, then fetched. */
+static int       s_wincap_state = 0;      /* 0 idle, 1 armed, 2 ready */
+static uint32_t *s_wincap_px = NULL;
+static int       s_wincap_w = 0, s_wincap_h = 0;
+
+void gl_renderer_arm_window_capture(void) { s_wincap_state = 1; }
+
+int gl_renderer_take_window_capture(uint32_t **out, int *w, int *h) {
+    if (s_wincap_state != 2 || !s_wincap_px) return 0;
+    *out = s_wincap_px; *w = s_wincap_w; *h = s_wincap_h;
+    s_wincap_state = 0;
+    return 1;
+}
+
+static void wincap_grab(void) {
+    if (s_wincap_state != 1 || !s_win) return;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    size_t need = (size_t)ww * wh * sizeof(uint32_t);
+    uint32_t *nb = (uint32_t *)realloc(s_wincap_px, need);
+    if (!nb) return;
+    s_wincap_px = nb; s_wincap_w = ww; s_wincap_h = wh;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, ww, wh, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, s_wincap_px);
+    s_wincap_state = 2;
+}
+
+static void osd_gl_overlay(void) {
+    if (!s_ctx || !s_present_prog) return;
+    extern const uint32_t *psx_osd_render_panel(int *, int *, int);
+    int pw = 0, ph = 0;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    int z = ww >= 1280 ? 3 : (ww >= 800 ? 2 : 1);
+    const uint32_t *panel = psx_osd_render_panel(&pw, &ph, z);
+    if (!panel || pw <= 0 || ph <= 0) return;
+
+    if (!s_stats_osd_tex) {
+        glGenTextures(1, &s_stats_osd_tex);
+        glBindTexture(GL_TEXTURE_2D, s_stats_osd_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, s_stats_osd_tex);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pw, ph, 0, GL_BGRA,
+                 GL_UNSIGNED_INT_8_8_8_8_REV, panel);
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, wh - ph, pw, ph);          /* top-left of the window */
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_stats_osd_tex);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    /* Same UV convention as the main present quad, which is verifiably upright:
+     * a TOP-DOWN source texture with a 0..1 V range. The panel is top-down like
+     * the present buffer, so it needs no inversion -- an earlier guess flipped V
+     * here "to undo PRESENT_VS" and rendered the text upside down. */
+    p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+}
+
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
@@ -4254,3 +4458,4 @@ static const GpuRenderBackend GL_BACKEND = {
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }
+

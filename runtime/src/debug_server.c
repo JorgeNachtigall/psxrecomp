@@ -18,6 +18,7 @@
 #include "debug_server.h"
 #include "psx_bss.h"
 #include "nd_intro_ot.h"
+#include "osd.h"
 #include "latency_ring.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
@@ -7647,16 +7648,33 @@ static void handle_synth_recurse(int id, const char *json)
 #endif
 }
 
+/* osd: on-screen frame-stats overlay. {"cmd":"osd"} reports, {"cmd":"osd","enable":0|1}
+ * toggles. The overlay is composited into the present buffer, so it also shows up
+ * in `screenshot` output — a captured frame then carries its own timing. */
+static void handle_osd(int id, const char *json)
+{
+    extern int  psx_osd_enabled(void);
+    extern void psx_osd_set_enabled(int);
+    extern unsigned long long psx_osd_draw_count(void);
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) psx_osd_set_enabled(en);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"draws\":%llu}",
+             id, psx_osd_enabled(), psx_osd_draw_count());
+}
+
 static void handle_frame_perf(int id, const char *json)
 {
     (void)json;
-    double all[18], wide[18], n43[18];
+    double all[20], wide[20], n43[20];
     int na = gl_renderer_perf_aggregate(-1, all);
     gl_renderer_perf_aggregate(1, wide);
     gl_renderer_perf_aggregate(0, n43);
     if (na <= 0) { send_err(id, "no frame_perf samples (GL timer queries unavailable, or no GL frames yet)"); return; }
-    /* per-prim GPU microseconds (scene_gpu / prims): high => draw-call/state-change
-     * bound (batching wins); low => per-triangle/fill bound. */
+    /* per-prim GPU microseconds (scene_gpu BUSY / prims): high => draw-call/state-change
+     * bound (batching wins); low => per-triangle/fill bound. Computed from the
+     * TIMESTAMP-pair busy sum, NOT the whole-frame span — the span made a
+     * 284-prim frame read as 32 us/prim, which sent a widescreen session
+     * chasing a GPU bottleneck that was not there. */
     double wpp = wide[9] > 0 ? wide[5] * 1000.0 / wide[9] : 0.0;
     double npp = n43[9]  > 0 ? n43[5]  * 1000.0 / n43[9]  : 0.0;
     /* mirror split (wide frames only): canon = scene_gpu minus the mirror
@@ -7667,32 +7685,44 @@ static void handle_frame_perf(int id, const char *json)
     uint64_t br[8]; extern void gl_renderer_batch_diag(uint64_t out[8]);
     gl_renderer_batch_diag(br);
     send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
+             "\"game_fps\":%.2f,\"vsync_hz\":%.2f,\"game_frames\":%llu,"
              "\"tex_frac\":%.3f,\"ws_ablate\":%d,"
              "\"batch_diag\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
+             "\"scene_draws_avg\":%.1f,\"scene_draws_over_avg\":%.2f,"
              "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f},"
              "\"wide_16_9\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
-             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
+             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
+             "\"scene_draws_avg\":%.1f,\"scene_draws_over_avg\":%.2f,"
+             "\"present_gpu_ms_avg\":%.3f,"
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
-             "\"mirror_gpu_ms_avg\":%.3f,\"mirror_gpu_ms_max\":%.3f,\"canon_gpu_ms_avg\":%.3f,"
+             "\"mirror_timing_ok\":%d,\"mirror_gpu_ms_avg\":%.3f,\"mirror_gpu_ms_max\":%.3f,\"canon_gpu_ms_avg\":%.3f,"
              "\"mirror_passes_avg\":%.1f,\"mirror_pass_us\":%.3f,"
              "\"cpu_flush_ms_avg\":%.3f,\"cpu_wide_ms_avg\":%.3f,\"batches_avg\":%.1f,"
              "\"wide_sets_avg\":%.1f,\"fbo_creates_avg\":%.2f},"
              "\"a4_3\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
-             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
+             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
+             "\"scene_draws_avg\":%.1f,\"scene_draws_over_avg\":%.2f,"
+             "\"present_gpu_ms_avg\":%.3f,"
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
              "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f}}",
-             id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
+             id, na, (int)wide[0], (int)n43[0],
+             psx_osd_game_fps(), psx_osd_vsync_hz(),
+             (unsigned long long)psx_osd_game_frame_count(),
+             tex_frac, gl_renderer_get_ws_ablate(),
              (unsigned long long)br[0], (unsigned long long)br[1],
              (unsigned long long)br[2], (unsigned long long)br[3],
              (unsigned long long)br[4], (unsigned long long)br[5],
              (unsigned long long)br[6], (unsigned long long)br[7],
-             all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8], all[9],
-             (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7], wide[9], wpp,
-             wide[10], wide[11], wcanon, wide[12], wmpp,
+             all[1], all[2], all[3], all[4], all[5], all[6], all[18], all[19],
+             all[7], all[8], all[9],
+             (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[18], wide[19],
+             wide[7], wide[9], wpp,
+             gl_renderer_perf_mirror_timing_ok(), wide[10], wide[11], wcanon, wide[12], wmpp,
              wide[13], wide[14], wide[15], wide[16], wide[17],
-             (int)n43[0], n43[1], n43[3], n43[5], n43[6], n43[7], n43[9], npp,
+             (int)n43[0], n43[1], n43[3], n43[5], n43[6], n43[18], n43[19],
+             n43[7], n43[9], npp,
              n43[13], n43[15]);
 }
 
@@ -8597,6 +8627,46 @@ static void handle_screenshot_file(int id, const char *json)
  * so what lands in the PNG is what the player sees. Falls back to the native
  * resolve when no hi-res surface exists (supersampling 1 / software), so the
  * command always answers with something truthful about the actual output. */
+/* window_capture: what is ACTUALLY on screen, read back from the default
+ * framebuffer at swap time. Unlike `screenshot` (raw VRAM) and
+ * `screenshot_hires` (compositor surface), this sees GPU-side overlays.
+ * Two calls: the first arms it, the second (after >=1 frame) writes the PNG. */
+static void handle_window_capture(int id, const char *json)
+{
+    extern void gl_renderer_arm_window_capture(void);
+    extern int  gl_renderer_take_window_capture(uint32_t **, int *, int *);
+    uint32_t *px = NULL; int w = 0, h = 0;
+    if (!gl_renderer_take_window_capture(&px, &w, &h)) {
+        gl_renderer_arm_window_capture();
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":true}", id);
+        return;
+    }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_window.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { send_err(id, "alloc failed"); return; }
+    /* glReadPixels origin is bottom-left; flip to top-down for the PNG. */
+    for (int y = 0; y < h; y++) {
+        const uint32_t *src = px + (size_t)(h - 1 - y) * w;
+        for (int x = 0; x < w; x++) {
+            uint32_t p = src[x];
+            uint8_t *d = rgb + ((size_t)y * w + x) * 3;
+            d[0] = (uint8_t)((p >> 16) & 0xFF);
+            d[1] = (uint8_t)((p >> 8) & 0xFF);
+            d[2] = (uint8_t)(p & 0xFF);
+        }
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, (uint32_t)w, (uint32_t)h);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+             id, path, w, h);
+}
+
 static void handle_screenshot_hires(int id, const char *json)
 {
     GpuDisplayInfo di;
@@ -8618,9 +8688,24 @@ static void handle_screenshot_hires(int id, const char *json)
         strncpy(path, "psx_screenshot_hires.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
+    /* NATIVE-WIDE: the presented frame comes from the wide compositor surface,
+     * not the canonical one. Capturing via gr_render_display_hires here yielded
+     * a canonical-width image inside a wide buffer — a narrow strip of scene
+     * over black. Route the same way present does, and fall back to canonical
+     * if the displayed buffer has no wide surface yet. */
+    int wide_cap = (ws_native_wide_active() && gr_wide_supported());
+    uint32_t pw = wide_cap ? w + (uint32_t)ws_nw_extra() : w;
+    ow = pw * (uint32_t)scale;
     uint32_t *argb = (uint32_t *)malloc((size_t)ow * oh * sizeof(uint32_t));
     if (!argb) { send_err(id, "alloc failed"); return; }
-    int got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
+    int got = 0;
+    if (wide_cap) {
+        got = gr_render_wide_display(argb, (int)(ow * sizeof(uint32_t)),
+                                     (int)di.display_x, (int)di.display_y, (int)h);
+        if (!got) { wide_cap = 0; ow = w * (uint32_t)scale; }
+    }
+    if (!got)
+        got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
                                       (int)di.display_y, (int)w, (int)h);
     if (!got) {
         /* No hi-res surface (scale 1, or a backend without one): resolve the
@@ -8633,6 +8718,11 @@ static void handle_screenshot_hires(int id, const char *json)
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
     if (!rgb) { free(argb); send_err(id, "alloc failed"); return; }
+    /* Frame-stats overlay, when enabled. This capture is the AS-PRESENTED one,
+     * so the overlay belongs here; plain `screenshot` stays a faithful raw-VRAM
+     * capture and is deliberately left untouched. */
+    { extern void psx_osd_draw_argb(uint32_t *, int, int, int);
+      psx_osd_draw_argb(argb, (int)ow, (int)oh, (int)(ow * sizeof(uint32_t))); }
     for (size_t i = 0; i < (size_t)ow * oh; i++) {
         uint32_t p = argb[i];
         rgb[i * 3 + 0] = (uint8_t)((p >> 16) & 0xFF);
@@ -13184,6 +13274,8 @@ static const CmdEntry s_commands[] = {
     { "gl_present_ring",   handle_gl_present_ring },
     { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
+    { "osd",               handle_osd },
+    { "window_capture",    handle_window_capture },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
     { "gl_interp",         handle_gl_interp },
     { "gl_wide_fast",      handle_gl_wide_fast },

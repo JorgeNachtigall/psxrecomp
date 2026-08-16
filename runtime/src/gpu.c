@@ -24,6 +24,7 @@
 #include "color_lut.h"
 #include "mod_runtime.h"
 #include "sio.h"
+#include "osd.h"
 #include "ws_cull_detect.h"
 #include "ws_aspect_cone_math.h"
 #include "ws_ui_group.h"
@@ -5076,8 +5077,19 @@ static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
-    display_area_x = val & 0x3FF;
-    display_area_y = (val >> 10) & 0x1FF;
+    uint32_t nx = val & 0x3FF;
+    uint32_t ny = (val >> 10) & 0x1FF;
+
+    /* A change here is a double-buffered title publishing a finished frame, so
+     * it is the one place that knows the rate a player actually perceives. A
+     * game that misses its vblank deadline re-issues the SAME start address (or
+     * simply doesn't issue one) and holds the buffer for another vblank, which
+     * is why this must be gated on the value really changing. */
+    if (nx != display_area_x || ny != display_area_y)
+        psx_osd_game_frame_tick();
+
+    display_area_x = nx;
+    display_area_y = ny;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
 }
 
