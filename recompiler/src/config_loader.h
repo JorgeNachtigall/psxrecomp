@@ -909,6 +909,11 @@ struct GameConfig {
     // guarantee, that the rect is a backdrop.
     bool ws_nw_backdrop_rects = false;
 
+    // [widescreen] nw_backdrop_fill — "0xRRGGBB". With nw_backdrop on, paint the
+    // native-wide reveal margins this colour when the backdrop quad is detected,
+    // instead of stretching the quad. Empty string = off (stretch as before).
+    std::string ws_nw_backdrop_fill;
+
     // Expand only textured polygon vertices that already lie beyond the
     // canonical 4:3 boundary. Useful for finite arena/background meshes while
     // leaving actors, HUD, sprites, and centre geometry untouched.

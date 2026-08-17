@@ -318,6 +318,11 @@ void gpu_ws_set_nw_backdrop(int on);
  * stretch untextured primitives in the wide mirror without changing the
  * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
 void gpu_ws_set_nw_flat_backdrop(int on);
+/* Native-wide backdrop margin FILL ([widescreen] nw_backdrop_fill): when a
+ * full-display-width backdrop quad is detected, paint the reveal margins with
+ * this colour instead of stretching the quad. For authored 2D screens whose art
+ * sits on paper/sky that would simply continue past a wider frame. */
+void gpu_ws_set_nw_backdrop_fill(int on, uint32_t rgb888);
 int  gpu_ws_nw_flat_backdrop_enabled(void);
 /* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
 void gpu_ws_set_nw_phase_backdrop(int on);
