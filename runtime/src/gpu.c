@@ -126,6 +126,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_w(void);
+static int32_t ws_disp_h(void);
 static void ws_clear_all_reveal_margins(void);
 
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
@@ -1696,6 +1697,17 @@ void gpu_ws_set_nw_textured_edges(int on, int scale_pct) {
     ws_nw_textured_edges = on ? 1 : 0;
     g_ws_tex_edge_pct = scale_pct;
 }
+/* [widescreen] nw_backdrop_rects — a 2D screen that paints its background as
+ * TEXTURED RECTANGLES spanning the full display height (a strip layer: one rect
+ * per texture page, laid side by side across the 4:3 frame) has nothing to
+ * reveal in the native-wide margins, because a PS1 sprite cannot scale and the
+ * game authored the strip exactly 4:3 wide. Stretching that layer — and only
+ * that layer — into the margins fills them with its own material, while every
+ * other prim (logos, characters, text) keeps its authored size and position.
+ * Mirror-side only: canonical 4:3 VRAM is untouched, as everywhere in native-
+ * wide. Opt-in, because "full-height rect" is only a backdrop by convention. */
+static int ws_nw_backdrop_rects = 0;
+void gpu_ws_set_nw_backdrop_rects(int on) { ws_nw_backdrop_rects = on ? 1 : 0; }
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -1781,6 +1793,15 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_backdrop_rects) {
+        uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+        if (op >= 0x64u && op <= 0x67u) {           /* variable-size textured rect */
+            uint32_t yraw = (gp0_cmd_buf[1] >> 16) & 0x7FFu;
+            int32_t y = (int32_t)(yraw & 0x400u ? yraw | 0xFFFFF800u : yraw);
+            int32_t h = (int32_t)((gp0_cmd_buf[3] >> 16) & 0x1FFu);
+            if (y <= 0 && y + h >= ws_disp_h()) return 1;
+        }
+    }
     if (ws_nw_textured_edges) {
         uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
         if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
@@ -2067,8 +2088,35 @@ void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
 static int ws_nw_flat_backdrop = 0;
 void gpu_ws_set_nw_flat_backdrop(int on) { ws_nw_flat_backdrop = on ? 1 : 0; }
 int gpu_ws_nw_flat_backdrop_enabled(void) { return ws_nw_flat_backdrop; }
+/* [widescreen] nw_backdrop_fill — PAINT the reveal margins instead of stretching
+ * the backdrop quad. Some authored 2D screens (a map, a manual page) put their
+ * art on a full-width panel whose *material* continues past the frame: paper,
+ * cloud, sky. Stretching the panel there is wrong twice over — it distorts the
+ * art and, when the panel is only a backing layer for a picture drawn on top,
+ * it reveals a colour the player never sees in 4:3. Filling the margins with the
+ * material's own colour is what the screen would have looked like if it had been
+ * authored wide. The quad is detected exactly as for the stretch (full display
+ * width, axis-aligned, real vertical extent); the fill covers the FULL frame
+ * height, because the panel's height is an artefact of its layout, not of how
+ * far the material reaches. Canonical 4:3 is untouched: the margins exist only
+ * in the wide surface. */
+static int      ws_nw_backdrop_fill_on  = 0;
+static uint32_t ws_nw_backdrop_fill_rgb = 0;   /* 0xRRGGBB, as configured */
+/* Frame in which a full-bleed backdrop panel was last seen. The fill is applied
+ * at the NEXT framebuffer clear (a couple of frames of slack so it survives the
+ * double buffer), which is what puts it underneath everything the screen draws. */
+static uint32_t ws_nw_fill_arm_frame = 0xFFFFFFFFu;
+int ws_nw_backdrop_fill_armed(void) {
+    return ws_nw_backdrop_fill_on &&
+           (uint32_t)s_frame_count - ws_nw_fill_arm_frame <= 2u;
+}
+void gpu_ws_set_nw_backdrop_fill(int on, uint32_t rgb888) {
+    ws_nw_backdrop_fill_on = on ? 1 : 0;
+    ws_nw_backdrop_fill_rgb = rgb888 & 0xFFFFFFu;
+}
 static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
-    if (!ws_nw_backdrop || !ws_native_wide_active()) return 0;
+    if ((!ws_nw_backdrop && !ws_nw_backdrop_fill_on) || !ws_native_wide_active())
+        return 0;
     int32_t extra = ws_nw_extra();
     if (extra <= 0) return 0;
     int32_t W = ws_disp_w();
@@ -2088,6 +2136,30 @@ static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
         int xe = (vx[i] - minx <= EDGE) || (maxx - vx[i] <= EDGE);
         int ye = (vy[i] - miny <= EDGE) || (maxy - vy[i] <= EDGE);
         if (!xe || !ye) return 0;
+    }
+    /* nw_backdrop_fill: paint the margins in the backdrop material's colour
+     * instead of stretching the panel. Two rules keep this off screens it would
+     * wreck, both learned the hard way on this game's pause menu:
+     *
+     *  - FULL-BLEED ONLY. A backdrop runs to the frame edge; a window panel is
+     *    inset. The pause menu's panel spans 18..302 of 320 and passed the
+     *    stretch test's 24 px slack, so the loose test is not a backdrop test.
+     *    The fill demands FILL_EDGE (8 px) on BOTH sides — the map screen's
+     *    panel is 2..318, the pause menu's is not close.
+     *  - PAINT AT THE CLEAR, NOT HERE. This panel is drawn AFTER the pause
+     *    menu's wallpaper grid, so painting margins at panel time erased the
+     *    wallpaper the widened grid had just put there. Instead arm a latch and
+     *    let gp0_exec_fill_rect paint the margins when the game clears its
+     *    framebuffer, before anything is drawn — so a screen that paints its own
+     *    margins (wallpaper, title grass) simply covers the fill.
+     *
+     * With the fill configured the stretch never runs: a game that wants its
+     * backdrop margins painted does not also want its panels widened. */
+    if (ws_nw_backdrop_fill_on) {
+        const int32_t FILL_EDGE = 8;
+        if (minx <= FILL_EDGE && maxx >= W - FILL_EDGE)
+            ws_nw_fill_arm_frame = (uint32_t)s_frame_count;
+        return 0;
     }
     /* Stretch X about the display centre by (W+extra)/W so [0,W] -> [-off, W+off],
      * which the wide compositor (+off) maps onto the full [0, W+extra] surface. */
@@ -3662,6 +3734,16 @@ static void gp0_exec_fill_rect(void) {
      * content region and keeping the revealed margins clean. */
     if (ws_native_wide_active() && ws_is_fb_base(dst_x)) {
         gr_wide_clear((int)dst_x, (int)dst_y, (int)height, color16);
+        /* [widescreen] nw_backdrop_fill — this screen's backdrop runs to the
+         * frame edge, so its material, not the clear colour, is what belongs in
+         * the reveal margins. Painted here, under everything the frame draws. */
+        if (ws_nw_backdrop_fill_armed()) {
+            uint32_t rgb = ws_nw_backdrop_fill_rgb;
+            uint16_t c = (uint16_t)((((rgb >> 16) & 0xFF) >> 3)
+                                  | (((((rgb >> 8) & 0xFF) >> 3)) << 5)
+                                  | (((rgb & 0xFF) >> 3) << 10));
+            gr_wide_clear_margins((int)dst_x, (int)dst_y, (int)height, c, 3);
+        }
     }
 }
 

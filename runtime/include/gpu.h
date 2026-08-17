@@ -318,9 +318,24 @@ void gpu_ws_set_nw_backdrop(int on);
  * stretch untextured primitives in the wide mirror without changing the
  * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
 void gpu_ws_set_nw_flat_backdrop(int on);
+/* Native-wide backdrop margin FILL ([widescreen] nw_backdrop_fill): when a
+ * full-display-width backdrop quad is detected, paint the reveal margins with
+ * this colour instead of stretching the quad. For authored 2D screens whose art
+ * sits on paper/sky that would simply continue past a wider frame. */
+void gpu_ws_set_nw_backdrop_fill(int on, uint32_t rgb888);
 int  gpu_ws_nw_flat_backdrop_enabled(void);
 /* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
 void gpu_ws_set_nw_phase_backdrop(int on);
+/* Native-wide backdrop-strip stretch ([widescreen] nw_backdrop_rects): stretch
+ * full-display-height TEXTURED RECTANGLES — a 2D screen's background strip
+ * layer, which a PS1 sprite cannot scale to the wider frame — in the wide
+ * mirror only, leaving every other primitive at its authored size. */
+void gpu_ws_set_nw_backdrop_rects(int on);
+/* Native-wide backdrop-strip stretch ([widescreen] nw_backdrop_rects): stretch
+ * full-display-height TEXTURED RECTANGLES — a 2D screen's background strip
+ * layer, which a PS1 sprite cannot scale to the wider frame — in the wide
+ * mirror only, leaving every other primitive at its authored size. */
+void gpu_ws_set_nw_backdrop_rects(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the

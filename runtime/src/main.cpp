@@ -5338,6 +5338,16 @@ int main(int argc, char** argv) {
             /* [widescreen] nw_phase_backdrop — stretch only the textured
              * backdrop phase emitted before shaded 3D foreground geometry. */
             gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
+            /* [widescreen] nw_backdrop_rects — stretch full-height textured
+             * background strips into the reveal margins (mirror only). */
+            gpu_ws_set_nw_backdrop_rects(gc.ws_nw_backdrop_rects ? 1 : 0);
+            /* [widescreen] nw_backdrop_fill — paint the reveal margins in the
+             * backdrop material's colour rather than stretching the panel. */
+            gpu_ws_set_nw_backdrop_fill(
+                gc.ws_nw_backdrop_fill.empty() ? 0 : 1,
+                gc.ws_nw_backdrop_fill.empty()
+                    ? 0u
+                    : (uint32_t)std::stoul(gc.ws_nw_backdrop_fill, nullptr, 16));
             gpu_ws_set_nw_textured_edges(gc.ws_nw_textured_edges ? 1 : 0,
                                          gc.ws_nw_textured_edge_scale);
             gl_renderer_set_wide_fast(gc.ws_nw_full_mirror ? 0 : 1);
