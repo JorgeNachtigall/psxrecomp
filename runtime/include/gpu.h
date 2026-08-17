@@ -321,6 +321,16 @@ void gpu_ws_set_nw_flat_backdrop(int on);
 int  gpu_ws_nw_flat_backdrop_enabled(void);
 /* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
 void gpu_ws_set_nw_phase_backdrop(int on);
+/* Native-wide backdrop-strip stretch ([widescreen] nw_backdrop_rects): stretch
+ * full-display-height TEXTURED RECTANGLES — a 2D screen's background strip
+ * layer, which a PS1 sprite cannot scale to the wider frame — in the wide
+ * mirror only, leaving every other primitive at its authored size. */
+void gpu_ws_set_nw_backdrop_rects(int on);
+/* Native-wide backdrop-strip stretch ([widescreen] nw_backdrop_rects): stretch
+ * full-display-height TEXTURED RECTANGLES — a 2D screen's background strip
+ * layer, which a PS1 sprite cannot scale to the wider frame — in the wide
+ * mirror only, leaving every other primitive at its authored size. */
+void gpu_ws_set_nw_backdrop_rects(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the

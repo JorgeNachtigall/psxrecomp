@@ -901,6 +901,14 @@ struct GameConfig {
     // off by default because draw ordering is title-specific.
     bool ws_nw_phase_backdrop = false;
 
+    // [widescreen] nw_backdrop_rects — stretch full-display-height textured
+    // rectangles (a 2D screen's background strip layer) into the native-wide
+    // reveal margins. Sprites cannot scale on PS1, so such a layer is authored
+    // exactly 4:3 wide and leaves the margins empty otherwise. Mirror-side
+    // only; off by default because "full-height rect" is a convention, not a
+    // guarantee, that the rect is a backdrop.
+    bool ws_nw_backdrop_rects = false;
+
     // Expand only textured polygon vertices that already lie beyond the
     // canonical 4:3 boundary. Useful for finite arena/background meshes while
     // leaving actors, HUD, sprites, and centre geometry untouched.

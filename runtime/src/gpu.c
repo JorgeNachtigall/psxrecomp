@@ -126,6 +126,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_w(void);
+static int32_t ws_disp_h(void);
 static void ws_clear_all_reveal_margins(void);
 
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
@@ -1696,6 +1697,17 @@ void gpu_ws_set_nw_textured_edges(int on, int scale_pct) {
     ws_nw_textured_edges = on ? 1 : 0;
     g_ws_tex_edge_pct = scale_pct;
 }
+/* [widescreen] nw_backdrop_rects — a 2D screen that paints its background as
+ * TEXTURED RECTANGLES spanning the full display height (a strip layer: one rect
+ * per texture page, laid side by side across the 4:3 frame) has nothing to
+ * reveal in the native-wide margins, because a PS1 sprite cannot scale and the
+ * game authored the strip exactly 4:3 wide. Stretching that layer — and only
+ * that layer — into the margins fills them with its own material, while every
+ * other prim (logos, characters, text) keeps its authored size and position.
+ * Mirror-side only: canonical 4:3 VRAM is untouched, as everywhere in native-
+ * wide. Opt-in, because "full-height rect" is only a backdrop by convention. */
+static int ws_nw_backdrop_rects = 0;
+void gpu_ws_set_nw_backdrop_rects(int on) { ws_nw_backdrop_rects = on ? 1 : 0; }
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -1781,6 +1793,15 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_backdrop_rects) {
+        uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+        if (op >= 0x64u && op <= 0x67u) {           /* variable-size textured rect */
+            uint32_t yraw = (gp0_cmd_buf[1] >> 16) & 0x7FFu;
+            int32_t y = (int32_t)(yraw & 0x400u ? yraw | 0xFFFFF800u : yraw);
+            int32_t h = (int32_t)((gp0_cmd_buf[3] >> 16) & 0x1FFu);
+            if (y <= 0 && y + h >= ws_disp_h()) return 1;
+        }
+    }
     if (ws_nw_textured_edges) {
         uint32_t op = (gp0_cmd_buf[0] >> 24) & 0xFFu;
         if (op >= 0x20u && op <= 0x3Fu && (op & 0x04u))
